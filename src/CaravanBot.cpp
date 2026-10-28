@@ -553,6 +553,7 @@ static struct
 	DWORD deadline = 0;
 	int presses = 0;
 	int stuck = 0;
+	int retries = 0;              // extra clicks when the game ignored the first one
 	int lastIdx = -99, lastTrack = -99, lastRow = -99;
 } g_exec;
 
@@ -836,7 +837,7 @@ static void TryStartMove(DWORD now)
 	}
 
 	g_exec.move = m;
-	g_exec.presses = g_exec.stuck = 0;
+	g_exec.presses = g_exec.stuck = g_exec.retries = 0;
 	g_exec.lastIdx = g_exec.lastTrack = g_exec.lastRow = -99;
 	g_exec.nextActionTick = now;
 	g_turn.awaiting = false;
@@ -876,6 +877,15 @@ static void StepMove(const Snapshot &s, DWORD now)
 			FinishMove(s, "error: card index out of range");
 			return;
 		}
+		// A late answer to an earlier Select click: the card is already picked up, so clicking
+		// Select again would drop it wherever the cursor is.
+		if (m.action == "place" && (s.flags & kFlag_IsPlaceCard))
+		{
+			g_exec.phase = kPhase_Navigate;
+			g_exec.presses = g_exec.stuck = 0;
+			g_exec.nextActionTick = now + 150;
+			return;
+		}
 		if (s.selectedCardIdx == m.card)
 		{
 			if (m.action == "discard")
@@ -912,6 +922,26 @@ static void StepMove(const Snapshot &s, DWORD now)
 			g_exec.phase = kPhase_Navigate;
 			g_exec.presses = g_exec.stuck = 0;
 			g_exec.nextActionTick = now + 150;
+		}
+		else if (now > g_exec.deadline && g_exec.retries < 3)
+		{
+			// The game sometimes ignores the click, mostly on a card that was just drawn and is
+			// still sliding into the hand. Click again instead of giving the turn back.
+			g_exec.retries++;
+			Log("Turn " + std::to_string(m.turn) + ": no reaction to the click, retry " + std::to_string(g_exec.retries));
+			if (m.action == "discard_track")
+			{
+				ClickButton(kButton_CGM_DiscardTrack, kOff_Tile_CGM_DiscardTrackButton);
+				g_exec.deadline = now + 2000;
+				g_exec.nextActionTick = now + 200;
+			}
+			else
+			{
+				g_exec.phase = kPhase_SelectHandCard;
+				g_exec.presses = g_exec.stuck = 0;
+				g_exec.lastIdx = -99;
+				g_exec.nextActionTick = now + 300;
+			}
 		}
 		else if (now > g_exec.deadline)
 		{
@@ -1195,7 +1225,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface *nvse
 {
 	info->infoVersion = PluginInfo::kInfoVersion;
 	info->name = "CaravanBot";
-	info->version = 4;
+	info->version = 5;
 	return !nvse->isEditor;
 }
 
@@ -1218,6 +1248,6 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface *nvse)
 		Log("Could not register for NVSE messages.");
 		return false;
 	}
-	Log("CaravanBot v4 loaded (engine turn detection, legal moves, bot toggle on " + KeyName(g_bot.key) + ").");
+	Log("CaravanBot v5 loaded (engine turn detection, legal moves, click retry, bot toggle on " + KeyName(g_bot.key) + ").");
 	return true;
 }
