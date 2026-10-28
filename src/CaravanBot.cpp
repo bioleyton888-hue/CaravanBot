@@ -1,13 +1,14 @@
 // CaravanBot - xNVSE plugin for Fallout: New Vegas (runtime 1.4.0.525).
 //
-// Lets an outside player (Claude) play the Caravan minigame:
-//  - while the Caravan menu is open, the table is written to <game dir>\CaravanBot\state.json;
-//  - when it is the player's turn, state.turn.awaiting becomes true with a new turn id;
-//  - a move written to <game dir>\CaravanBot\move.json for that turn id is carried out by
-//    moving the menu's own cursor and clicking its own Select / Discard buttons;
-//  - the toggle key (F8 by default) at the Caravan table starts or stops the auto-player
-//    (bot.py, set up in <game dir>\CaravanBot\CaravanBot.ini) as a hidden process;
-//  - while the auto-player is on, a valid deck is accepted automatically on the deck screen.
+// Plays the Caravan minigame for you:
+//  - the toggle key (F8 by default, set in CaravanBot.ini next to this DLL) at the Caravan table
+//    turns the bot on or off;
+//  - on each of your turns the strategy engine (caravan_ai.h) picks a move, which is carried out
+//    by moving the menu's own cursor and clicking its own Select / Discard buttons;
+//  - while the bot is on, a valid deck is accepted automatically on the deck screen.
+// With ExternalControl=1 in the INI it also lets an outside player drive the table: the table
+// is written to <game dir>\CaravanBot\state.json (state.turn.awaiting marks your turn, with a
+// turn id), and a move written to <game dir>\CaravanBot\move.json for that turn id is played.
 // It patches no game code: everything runs on xNVSE's main-loop message.
 //
 // CaravanMenu layout comes from the type info in lStewieAl's BetterCaravan.pdb; the cursor
@@ -18,6 +19,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <string>
+
+#include "caravan_ai.h"
 
 typedef unsigned int UInt32;
 typedef UInt32 PluginHandle;
@@ -129,6 +132,7 @@ enum
 	kFlag_PreventInputs = 0x1,      // set for the whole NPC turn and during every animation
 	kFlag_NotEnoughCardsInDeck = 0x2,
 	kFlag_RestrictToFirstColumn = 0x100,
+	kFlag_PlayerWon = 0x400,           // on the results screen
 	kFlag_RestrictToFirstRow = 0x800,  // with RestrictToFirstColumn: the opening (one number card per caravan)
 	kFlag_IsPlaceCard = 0x1000,
 	kFlag_IsDiscardTrack = 0x2000,
@@ -442,6 +446,13 @@ static std::string CardCode(const Card &c)
 	return code;
 }
 
+// The opening: one number card per caravan, no discards.
+static bool IsOpening(const Snapshot &s)
+{
+	const UInt32 both = kFlag_RestrictToFirstColumn | kFlag_RestrictToFirstRow;
+	return (s.flags & both) == both;
+}
+
 // Signature of what changes when someone plays: hands, board and caravan values (not the cursor).
 static std::string TableSignature(const Snapshot &s)
 {
@@ -506,8 +517,10 @@ static int ScreenY(int track, int row) { return IsNpcTrack(track) ? -(row + 1) :
 // ---- Plugin state -----------------------------------------------------------------------
 
 static PluginHandle g_pluginHandle = 0;
-static std::string g_gameDir;  // no trailing backslash (it would escape the quote on bot.py's command line)
+static std::string g_gameDir;  // no trailing backslash
 static std::string g_outDir;
+static std::string g_iniPath;  // CaravanBot.ini next to the DLL (Data\NVSE\Plugins)
+static bool g_external = false;  // ExternalControl=1: write state.json and accept move.json
 static std::string g_lastJson;
 static UInt32 g_frame = 0;
 static UInt32 g_seq = 0;
@@ -560,11 +573,10 @@ static struct
 static struct
 {
 	bool enabled = false;
-	HANDLE process = nullptr;
-	HANDLE job = nullptr;
 	int key = kDIK_F8;          // DirectInput key code, from ToggleKey in CaravanBot.ini
 	bool keyWasDown = false;
 	bool hintShown = false;     // the "press F8" hint is shown once per game session
+	UInt32 lastTurnId = 0;      // the bot plays each awaited turn once
 } g_bot;
 
 static bool g_deckPlayClicked = false;
@@ -649,7 +661,7 @@ static std::string SnapshotJson(const Snapshot &s)
 
 	sprintf_s(buf, ",\"selected\":{\"cardIdx\":%d,\"track\":%d,\"row\":%d}", s.selectedCardIdx, s.selectedTrack, s.selectedRow);
 	j += buf;
-	bool opening = (s.flags & (kFlag_RestrictToFirstColumn | kFlag_RestrictToFirstRow)) == (kFlag_RestrictToFirstColumn | kFlag_RestrictToFirstRow);
+	bool opening = IsOpening(s);
 	sprintf_s(buf, ",\"turn\":{\"id\":%u,\"match\":%u,\"number\":%d,\"awaiting\":%s,\"executing\":%s,\"opening\":%s,\"lastResult\":\"",
 		g_turn.id, g_turn.match, g_turn.number, g_turn.awaiting ? "true" : "false",
 		g_exec.phase != kPhase_Idle ? "true" : "false", opening ? "true" : "false");
@@ -736,6 +748,14 @@ static void UpdateTurn(const Snapshot &s, DWORD now)
 		g_turn.lastMoveSig.clear();
 		Log("Match " + std::to_string(g_turn.match) + " started");
 	}
+	if (menu == kMenu_Results && g_turn.lastMenu != kMenu_Results)
+	{
+		const CaravanValue *v = s.caravanValues;
+		char buf[128];
+		sprintf_s(buf, "Result: %s | mine %d/%d/%d vs npc %d/%d/%d", (s.flags & kFlag_PlayerWon) ? "WON" : "LOST",
+			v[0].pileValue, v[1].pileValue, v[2].pileValue, v[5].pileValue, v[4].pileValue, v[3].pileValue);
+		Log(buf);
+	}
 	g_turn.lastMenu = menu;
 
 	bool playerTurn = IsPlayerTurn(s);
@@ -778,31 +798,10 @@ static void FinishMove(const Snapshot &s, const std::string &result)
 	Log("Turn " + std::to_string(g_exec.move.turn) + ": " + result);
 }
 
-static void TryStartMove(DWORD now)
+// Checks the move against the engine's rules and starts carrying it out. A rejected move keeps
+// the turn open (same id), so a corrected move can be sent straight away.
+static bool StartMove(Move m, DWORD now)
 {
-	if (!g_turn.awaiting || g_exec.phase != kPhase_Idle)
-		return;
-	std::string path = g_outDir + "\\move.json";
-	FILE *f = nullptr;
-	if (fopen_s(&f, path.c_str(), "rb") != 0 || !f)
-		return;
-	char buf[1024] = {};
-	fread(buf, 1, sizeof(buf) - 1, f);
-	fclose(f);
-	std::string text = buf;
-
-	Move m;
-	m.turn = JsonInt(text, "turn", -1);
-	if (m.turn != (int)g_turn.id)
-		return;  // stale or early move: leave the file, a newer one will replace it
-	m.action = JsonStr(text, "action");
-	m.card = JsonInt(text, "card", -1);
-	m.track = JsonInt(text, "track", -1);
-	m.row = JsonInt(text, "row", -1);
-	MoveFileExA(path.c_str(), (g_outDir + "\\move.done.json").c_str(), MOVEFILE_REPLACE_EXISTING);
-
-	// Check the move against the engine's rules first. A rejected move keeps the turn open (same
-	// id), so a corrected move can be sent straight away.
 	std::string rejection;
 	if (m.action == "place")
 	{
@@ -833,7 +832,7 @@ static void TryStartMove(DWORD now)
 	{
 		g_turn.lastResult = "rejected: " + rejection;
 		Log("Turn " + std::to_string(m.turn) + ": " + g_turn.lastResult);
-		return;
+		return false;
 	}
 
 	g_exec.move = m;
@@ -855,6 +854,92 @@ static void TryStartMove(DWORD now)
 	{
 		g_exec.phase = kPhase_SelectHandCard;
 	}
+	return true;
+}
+
+// ExternalControl: play the move an outside player wrote to move.json for the awaited turn.
+static void TryExternalMove(DWORD now)
+{
+	if (!g_turn.awaiting || g_exec.phase != kPhase_Idle)
+		return;
+	std::string path = g_outDir + "\\move.json";
+	FILE *f = nullptr;
+	if (fopen_s(&f, path.c_str(), "rb") != 0 || !f)
+		return;
+	char buf[1024] = {};
+	fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	std::string text = buf;
+
+	Move m;
+	m.turn = JsonInt(text, "turn", -1);
+	if (m.turn != (int)g_turn.id)
+		return;  // stale or early move: leave the file, a newer one will replace it
+	m.action = JsonStr(text, "action");
+	m.card = JsonInt(text, "card", -1);
+	m.track = JsonInt(text, "track", -1);
+	m.row = JsonInt(text, "row", -1);
+	MoveFileExA(path.c_str(), (g_outDir + "\\move.done.json").c_str(), MOVEFILE_REPLACE_EXISTING);
+	StartMove(m, now);
+}
+
+// The bot: on each awaited turn, ask the strategy engine for a move and play it.
+static void BotPlayTurn(const Snapshot &s, DWORD now)
+{
+	if (!g_turn.awaiting || g_exec.phase != kPhase_Idle || g_bot.lastTurnId == g_turn.id)
+		return;
+	g_bot.lastTurnId = g_turn.id;
+	if (!g_turn.legalValid)
+	{
+		Log("Turn " + std::to_string(g_turn.id) + ": could not read the legal moves; play this turn yourself");
+		return;
+	}
+
+	caravan_ai::Input in = {};
+	for (int t = 0; t < kNumTracks; t++)
+		for (int r = 0; r < kNumRows; r++)
+		{
+			if (s.cellCount[r][t] == 0)
+				continue;
+			int kings = 0;
+			for (int i = 1; i < s.cellCount[r][t]; i++)
+				kings += s.cells[r][t][i].value == caravan_ai::kKing;
+			in.board.rows[t][in.board.count[t]++] = {s.cells[r][t][0].value, s.cells[r][t][0].suit, kings};
+		}
+	for (int i = 0; i < s.numPlayerHand; i++)
+		in.hand.push_back({s.playerHand[i].value, s.playerHand[i].suit, CardCode(s.playerHand[i])});
+	for (int i = 0; i < s.numPlayerHand && i < kMaxHand; i++)
+	{
+		caravan_ai::LegalMove lm = {i, {}};
+		for (int t = 0; t < kNumTracks; t++)
+			for (int r = 0; r < kNumRows; r++)
+				if (g_turn.legal[i][t][r])
+					lm.targets.push_back({t, r});
+		if (!lm.targets.empty())
+			in.legal.push_back(lm);
+	}
+	bool opening = IsOpening(s);
+	in.canDiscardCard = !opening;
+	for (int t = 0; t < 3 && !opening; t++)
+		if (in.board.count[t] > 0)
+			in.discardTracks.push_back(t);
+	in.opponentHand = s.numOpponentHand;
+
+	caravan_ai::Choice c = caravan_ai::ChooseMove(in);
+	std::string hand;
+	for (auto &h : in.hand)
+		hand += (hand.empty() ? "" : " ") + h.code;
+	Log("Turn " + std::to_string(g_turn.id) + " (#" + std::to_string(g_turn.number) + ") hand [" + hand + "]: " + c.reason);
+	if (c.action == caravan_ai::kAction_None)
+		return;
+
+	Move m;
+	m.turn = (int)g_turn.id;
+	m.action = c.action == caravan_ai::kAction_Place ? "place" : c.action == caravan_ai::kAction_Discard ? "discard" : "discard_track";
+	m.card = c.card;
+	m.track = c.track;
+	m.row = c.row;
+	StartMove(m, now);
 }
 
 static void StepMove(const Snapshot &s, DWORD now)
@@ -1065,10 +1150,8 @@ static void HandleDeckScreen(const Snapshot &s, DWORD now)
 	Log("Deck building: clicked Play with " + std::to_string(s.cardsInDeck) + " cards");
 }
 
-// ---- Auto-player: the toggle key starts or stops bot.py ---------------------------------
+// ---- Bot toggle -------------------------------------------------------------------------
 
-// The bot runs hidden, writing to CaravanBot\bot.log. It is put in a job object that kills
-// it when the game closes, so it never outlives the game.
 static void BotMessage(const std::string &msg, const char *sound)
 {
 	Log(msg);
@@ -1080,7 +1163,7 @@ static void BotMessage(const std::string &msg, const char *sound)
 static std::string IniString(const char *key)
 {
 	char buf[MAX_PATH] = {};
-	GetPrivateProfileStringA("Bot", key, "", buf, sizeof(buf), (g_outDir + "\\CaravanBot.ini").c_str());
+	GetPrivateProfileStringA("Bot", key, "", buf, sizeof(buf), g_iniPath.c_str());
 	return buf;
 }
 
@@ -1093,64 +1176,18 @@ static std::string KeyName(int key)
 	return "key " + std::to_string(key);
 }
 
-static bool StartBot()
+static void SetBot(bool on)
 {
-	std::string python = IniString("Python"), script = IniString("Script"), captures = IniString("Captures");
-	if (python.empty() || script.empty() || captures.empty())
-	{
-		BotMessage("Caravan bot is not set up: fill in CaravanBot.ini", "UIMenuCancel");
-		return false;
-	}
-	std::string cmd = "\"" + python + "\" -I -u \"" + script + "\" \"" + g_gameDir + "\" \"" + captures + "\"";
-
-	SECURITY_ATTRIBUTES sa = {sizeof(sa), nullptr, TRUE};
-	HANDLE out = CreateFileA((g_outDir + "\\bot.log").c_str(), GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-		&sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-	STARTUPINFOA si = {sizeof(si)};
-	si.dwFlags = STARTF_USESTDHANDLES;
-	si.hStdOutput = si.hStdError = out;
-	PROCESS_INFORMATION pi = {};
-	BOOL ok = CreateProcessA(nullptr, &cmd[0], nullptr, nullptr, TRUE, CREATE_NO_WINDOW | CREATE_SUSPENDED,
-		nullptr, nullptr, &si, &pi);
-	DWORD err = GetLastError();
-	if (out != INVALID_HANDLE_VALUE)
-		CloseHandle(out);
-	if (!ok)
-	{
-		BotMessage("Caravan bot could not start (error " + std::to_string(err) + "); check Python in CaravanBot.ini", "UIMenuCancel");
-		return false;
-	}
-
-	if (!g_bot.job)
-	{
-		g_bot.job = CreateJobObjectA(nullptr, nullptr);
-		JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = {};
-		limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
-		if (g_bot.job)
-			SetInformationJobObject(g_bot.job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
-	}
-	if (!g_bot.job || !AssignProcessToJobObject(g_bot.job, pi.hProcess))
-		Log("Bot: could not tie it to the game process; it may keep running after the game closes");
-	ResumeThread(pi.hThread);
-	CloseHandle(pi.hThread);
-	g_bot.process = pi.hProcess;
-	g_bot.enabled = true;
-	BotMessage("Caravan bot: ON (" + KeyName(g_bot.key) + " to stop)", "UIMenuOK");
-	return true;
-}
-
-static void StopBot(const std::string &msg)
-{
-	if (g_bot.process)
-	{
-		TerminateProcess(g_bot.process, 0);
-		CloseHandle(g_bot.process);
-		g_bot.process = nullptr;
-	}
-	g_bot.enabled = false;
-	// A move the bot wrote just before stopping must not be played for you.
-	DeleteFileA((g_outDir + "\\move.json").c_str());
-	BotMessage(msg, "UIMenuCancel");
+	g_bot.enabled = on;
+	// Replay the current turn's decision when the bot comes on mid-turn.
+	g_bot.lastTurnId = 0;
+	// A move written just before the switch must not be played.
+	if (g_external)
+		DeleteFileA((g_outDir + "\\move.json").c_str());
+	if (on)
+		BotMessage("Caravan bot: ON (" + KeyName(g_bot.key) + " to stop)", "UIMenuOK");
+	else
+		BotMessage("Caravan bot: OFF (" + KeyName(g_bot.key) + " to start)", "UIMenuCancel");
 }
 
 // Runs every frame: the key is only read while the Caravan menu is open.
@@ -1158,24 +1195,12 @@ static void PollToggleKey()
 {
 	bool down = GetMenu() && IsKeyHeld(g_bot.key);
 	if (down && !g_bot.keyWasDown)
-	{
-		if (g_bot.enabled)
-			StopBot("Caravan bot: OFF (" + KeyName(g_bot.key) + " to start)");
-		else
-			StartBot();
-	}
+		SetBot(!g_bot.enabled);
 	g_bot.keyWasDown = down;
 }
 
-static void UpdateBot(const Snapshot &s)
+static void ShowHint(const Snapshot &s)
 {
-	if (g_bot.enabled && g_bot.process && WaitForSingleObject(g_bot.process, 0) == WAIT_OBJECT_0)
-	{
-		DWORD code = 0;
-		GetExitCodeProcess(g_bot.process, &code);
-		Log("Bot: exited by itself with code " + std::to_string(code) + " (see bot.log)");
-		StopBot("Caravan bot stopped unexpectedly (see bot.log)");
-	}
 	if (s.active && !g_bot.enabled && !g_bot.hintShown)
 	{
 		g_bot.hintShown = true;
@@ -1197,7 +1222,7 @@ static void OnMessage(NVSEMessagingInterface::Message *msg)
 	bool readOk = TakeSnapshot(snap);
 	if (!readOk)
 		snap.ok = false;
-	UpdateBot(snap);
+	ShowHint(snap);
 
 	if (!snap.active)
 	{
@@ -1208,10 +1233,21 @@ static void OnMessage(NVSEMessagingInterface::Message *msg)
 	{
 		UpdateTurn(snap, now);
 		HandleDeckScreen(snap, now);
-		TryStartMove(now);
+		if (g_bot.enabled)
+			BotPlayTurn(snap, now);
+		else if (g_external)
+			TryExternalMove(now);
 		StepMove(snap, now);
 	}
 
+	if (!g_external)
+	{
+		static bool readFailLogged = false;
+		if (!readOk && !readFailLogged)
+			Log("Read of the Caravan menu failed (exception or bad array size).");
+		readFailLogged = !readOk;
+		return;
+	}
 	std::string json = SnapshotJson(snap);
 	if (json == g_lastJson)
 		return;
@@ -1225,7 +1261,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface *nvse
 {
 	info->infoVersion = PluginInfo::kInfoVersion;
 	info->name = "CaravanBot";
-	info->version = 5;
+	info->version = 6;
 	return !nvse->isEditor;
 }
 
@@ -1237,10 +1273,27 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface *nvse)
 		g_gameDir.pop_back();
 	g_outDir = g_gameDir + "\\CaravanBot";
 	CreateDirectoryA(g_outDir.c_str(), nullptr);
-	DeleteFileA((g_outDir + "\\move.json").c_str());
+
+	// The INI sits next to this DLL, wherever the mod manager put it.
+	HMODULE self = nullptr;
+	char dllPath[MAX_PATH] = {};
+	GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+		(LPCSTR)&NVSEPlugin_Load, &self);
+	GetModuleFileNameA(self, dllPath, sizeof(dllPath));
+	g_iniPath = dllPath;
+	g_iniPath = g_iniPath.substr(0, g_iniPath.find_last_of("\\/") + 1) + "CaravanBot.ini";
+
+	// A fresh log each game session.
+	FILE *f = nullptr;
+	if (fopen_s(&f, (g_outDir + "\\CaravanBot.log").c_str(), "w") == 0 && f)
+		fclose(f);
+
 	std::string key = IniString("ToggleKey");
 	if (!key.empty())
 		g_bot.key = (int)strtol(key.c_str(), nullptr, 0);
+	g_external = strtol(IniString("ExternalControl").c_str(), nullptr, 0) != 0;
+	if (g_external)
+		DeleteFileA((g_outDir + "\\move.json").c_str());
 
 	auto *messaging = (NVSEMessagingInterface *)nvse->QueryInterface(kInterface_Messaging);
 	if (!messaging || !messaging->RegisterListener(g_pluginHandle, "NVSE", OnMessage))
@@ -1248,6 +1301,6 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface *nvse)
 		Log("Could not register for NVSE messages.");
 		return false;
 	}
-	Log("CaravanBot v5 loaded (engine turn detection, legal moves, click retry, bot toggle on " + KeyName(g_bot.key) + ").");
+	Log("CaravanBot 1.0.0 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
 	return true;
 }

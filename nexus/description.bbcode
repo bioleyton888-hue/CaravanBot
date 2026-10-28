@@ -1,0 +1,56 @@
+[size=5][b]CaravanBot[/b][/size]
+
+Tired of losing your caps to Caravan? Sit down at any Caravan table, press [b]F8[/b], and the bot plays the match for you. Press [b]F8[/b] again whenever you want to take over.
+
+[size=4][b]Features[/b][/size]
+[list]
+[*]Plays every turn on its own: opening, building caravans to 21-26, Jacks on threats, Kings to bust the opponent's caravans.
+[*]Thinks about the opponent's likely reply, guessing only from their hand size. It never looks at their cards.
+[*]Plays through the Caravan menu's own cursor and buttons: no fake mouse or keyboard input, no game code patched.
+[*]On the deck screen, with the bot on, it accepts your deck and presses Play for you.
+[*]Switch it on or off at any point of a match. A corner message and a menu sound confirm each switch.
+[*]Self-contained: one xNVSE plugin, nothing else to install or run.
+[/list]
+
+[size=4][b]Requirements[/b][/size]
+[list]
+[*]Fallout: New Vegas, runtime [b]1.4.0.525[/b] (the current Steam version; other stores untested)
+[*][url=https://www.nexusmods.com/newvegas/mods/67883]xNVSE[/url]
+[*]Recommended: [url=https://www.nexusmods.com/newvegas/mods/81002]Better Caravan[/url] by lStewieAl. CaravanBot was developed and tested with it installed.
+[/list]
+
+[size=4][b]Installation[/b][/size]
+Install with Vortex or Mod Organizer 2 like any other mod. To install by hand, extract the archive into your [i]Data[/i] folder, so you get [i]Data\NVSE\Plugins\CaravanBot.dll[/i] and [i]CaravanBot.ini[/i].
+
+[size=4][b]Usage[/b][/size]
+[list]
+[*]Start a game of Caravan. The first time each session, a corner message reminds you of the key.
+[*]Press [b]F8[/b] to turn the bot on, and again to turn it off.
+[*]Every move and the reason for it are written to [i]Fallout New Vegas\CaravanBot\CaravanBot.log[/i].
+[/list]
+
+[size=4][b]Settings[/b][/size]
+Edit [i]Data\NVSE\Plugins\CaravanBot.ini[/i]:
+[list]
+[*][b]ToggleKey[/b]: DirectInput key code. 0x42 = F8 (default), 0x43 = F9, 0x44 = F10, 0x57 = F11.
+[*][b]ExternalControl[/b]: 1 lets an outside program play through two JSON files (for tinkerers; see the GitHub page).
+[/list]
+
+[size=4][b]Known issues[/b][/size]
+[list]
+[*]Queens are mostly used as filler; the bot doesn't plan around changing a caravan's direction.
+[*]If a deck has fewer than 30 cards, the bot tries to fill it, but that part is untested. Build a 30-card deck yourself to be safe.
+[*]Rarely the cursor can't reach its target while a card is picked up. Finish that move by hand; the bot continues on the next turn.
+[/list]
+
+[size=4][b]Uninstall[/b][/size]
+Remove it in your mod manager, or delete the two files from [i]Data\NVSE\Plugins[/i]. The [i]Fallout New Vegas\CaravanBot[/i] folder only holds the log.
+
+[size=4][b]Source[/b][/size]
+Full source, the strategy engine and the JSON protocol: [url=https://github.com/bioleyton888-hue/CaravanBot]github.com/bioleyton888-hue/CaravanBot[/url]
+
+[size=4][b]Credits[/b][/size]
+[list]
+[*][b]lStewieAl[/b]: the Caravan menu's memory layout and engine addresses come from the debug symbols shipped with Better Caravan.
+[*]The xNVSE team.
+[/list]
