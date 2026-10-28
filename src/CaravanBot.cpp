@@ -1008,10 +1008,11 @@ static void StepMove(const Snapshot &s, DWORD now)
 			g_exec.presses = g_exec.stuck = 0;
 			g_exec.nextActionTick = now + 150;
 		}
-		else if (now > g_exec.deadline && g_exec.retries < 3)
+		else if (now > g_exec.deadline && g_exec.retries < 6)
 		{
 			// The game sometimes ignores the click, mostly on a card that was just drawn and is
-			// still sliding into the hand. Click again instead of giving the turn back.
+			// still sliding into the hand. Click again instead of giving the turn back. In game the
+			// click landed about 7 s in (on the 4th try), so 6 retries leave room to spare.
 			g_exec.retries++;
 			Log("Turn " + std::to_string(m.turn) + ": no reaction to the click, retry " + std::to_string(g_exec.retries));
 			if (m.action == "discard_track")
@@ -1261,7 +1262,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface *nvse
 {
 	info->infoVersion = PluginInfo::kInfoVersion;
 	info->name = "CaravanBot";
-	info->version = 6;
+	info->version = 7;
 	return !nvse->isEditor;
 }
 
@@ -1301,6 +1302,6 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface *nvse)
 		Log("Could not register for NVSE messages.");
 		return false;
 	}
-	Log("CaravanBot 1.0.0 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
+	Log("CaravanBot 1.0.1 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
 	return true;
 }
