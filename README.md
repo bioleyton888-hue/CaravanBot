@@ -4,6 +4,8 @@ A bot that plays **Caravan**, the card minigame in *Fallout: New Vegas*, for you
 
 Sit down at a Caravan table, press **F8**, and the bot plays the rest of the match on its own. Press F8 again to take back control. It sends no fake mouse or keyboard input: an xNVSE plugin reads the table straight from the game's memory, decides the move itself, and plays it through the Caravan menu's own cursor and buttons. Everything runs inside the one DLL; there is nothing else to install or run.
 
+**Download:** [CaravanBot on Nexus Mods](https://www.nexusmods.com/newvegas/mods/100280)
+
 ## Requirements
 
 - *Fallout: New Vegas*, Steam version, runtime **1.4.0.525**. The plugin reads fixed memory addresses, so other game versions won't work.
@@ -12,7 +14,7 @@ Sit down at a Caravan table, press **F8**, and the bot plays the rest of the mat
 
 ## Install
 
-**With Vortex (or Mod Organizer 2):** install the `CaravanBot-<version>.zip` from the Nexus Mods page like any other mod. Drag it onto Vortex's Mods page, or use "Mod Manager Download", then enable and deploy it.
+**With Vortex (or Mod Organizer 2):** install the `CaravanBot-<version>.zip` from the [Nexus Mods page](https://www.nexusmods.com/newvegas/mods/100280) like any other mod. Drag it onto Vortex's Mods page, or use "Mod Manager Download", then enable and deploy it.
 
 **By hand:** unzip it into the game's `Data` folder, so that you end up with:
 
@@ -26,7 +28,7 @@ Fallout New Vegas\Data\NVSE\Plugins\CaravanBot.ini
 - **Start a Caravan game.** The first time each session, a corner message tells you which key turns the bot on.
 - **Press F8 to turn the bot on.** You'll see "Caravan bot: ON" and hear a menu sound. It plays every one of your turns.
 - **Press F8 again to turn it off** and play yourself. You can switch at any point of a match.
-- **Deck screen:** with the bot on, the plugin accepts your deck and presses Play for you. If your deck has fewer than 30 cards, it tries to fill it, but that part hasn't been tested yet. With the bot off, you build your deck yourself.
+- **Deck screen:** with the bot on, the plugin accepts your deck and presses Play for you. If your deck has fewer than 30 cards, it fills it from your collection first. With the bot off, you build your deck yourself.
 
 The plugin writes what it's doing, including every move and why it chose it, to `Fallout New Vegas\CaravanBot\CaravanBot.log`. The log starts fresh each time you launch the game.
 
@@ -111,6 +113,12 @@ You need Visual Studio 2022 Build Tools (C++).
 - Queens are only used on your own caravans. The bot doesn't use them to block the opponent's caravans.
 - If the cursor can't reach its target while a card is picked up, the plugin can't cancel. Finish that move by hand.
 - **Alt-tabbing:** on some setups, switching out of the game crashes it. The bot doesn't need you to leave the game.
+
+## Changelog
+
+- **1.0.2:** the bot tracks each caravan's direction and suit, and uses Queens to unblock its own caravans when its hand can't extend them, instead of playing them as filler.
+- **1.0.1:** retries a card click up to 6 times instead of 3. The game can ignore it for a few seconds while a drawn card slides into the hand.
+- **1.0.0:** first release. The strategy engine runs inside the plugin; no Python needed.
 
 ## Credits
 
