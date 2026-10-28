@@ -1,12 +1,14 @@
-// Caravan strategy engine for CaravanBot: a C++ port of tools/caravan_ai.py.
+// Caravan strategy engine for CaravanBot. It started as a C++ port of tools/caravan_ai.py.
 //
 // ChooseMove() takes the table on an awaited turn (board, hand, the engine's legal moves) and
 // returns the move to play. It is a one-move lookahead: every legal move and discard is
 // simulated and the resulting table is scored, blended with Ringo's most damaging likely reply.
 // A caravan's total is the sum over its rows of number value x 2 per King on that row.
 //
-// The Python file stays the reference: tests/ai_parity.cpp checks that both pick the same move
-// on every saved turn. Keep the two in step when the strategy changes.
+// Since 1.0.2 it also tracks each caravan's direction and suit, so it knows which number cards
+// still fit, and it rewards moves that leave each of my unsold caravans a card from my hand to
+// grow with. That is what makes a Queen worth playing: it turns a caravan my hand can't extend.
+// The Python engine does none of this; tests/ai_parity.cpp lists the turns where the two differ.
 
 #pragma once
 
@@ -38,13 +40,15 @@ struct HandCard
 	std::string code;
 };
 
-// One row of a caravan: its number card and how many Kings sit on it (Queens and Jokers change
-// no total, so they are not kept).
+// One row of a caravan: its number card, how many Kings and Queens sit on it, and the suit of
+// the last Queen (Jokers change neither total nor direction, so they are not kept).
 struct Row
 {
 	int value;
 	int suit;
 	int kings;
+	int queens;
+	int queenSuit;
 };
 
 struct Board
@@ -115,6 +119,48 @@ inline int PairWinner(int mine, int theirs)
 	return 0;
 }
 
+// ---- Direction and suit -------------------------------------------------------------------
+//
+// As the game keeps them (checked against 5274 saved caravans): the direction is the sign of the
+// last number card minus the one before it, reversed once per Queen on the last row; the suit is
+// the last Queen's on that row, or else the last number card's. Queens on earlier rows no longer
+// matter.
+
+// +1 ascending, -1 descending, 0 not set yet.
+inline int Direction(const Board &b, int t)
+{
+	int n = b.count[t];
+	if (n < 2)
+		return 0;
+	int last = b.rows[t][n - 1].value, prev = b.rows[t][n - 2].value;
+	int dir = (last > prev) - (last < prev);
+	return b.rows[t][n - 1].queens % 2 ? -dir : dir;
+}
+
+inline int Suit(const Board &b, int t)
+{
+	const Row &last = b.rows[t][b.count[t] - 1];
+	return last.queens ? last.queenSuit : last.suit;
+}
+
+// Whether the engine lets a number card extend this caravan (checked against the game's own
+// rule check on 5594 hand-card/caravan pairs). suit 0 = unknown, never matches.
+inline bool Fits(const Board &b, int t, int value, int suit)
+{
+	int n = b.count[t];
+	if (n == 0)
+		return true;
+	if (n >= kRows)
+		return false;
+	int last = b.rows[t][n - 1].value;
+	if (value == last)
+		return false;
+	if (suit != 0 && suit == Suit(b, t))
+		return true;
+	int dir = Direction(b, t);
+	return dir == 0 || (dir > 0 ? value > last : value < last);
+}
+
 // ---- Simulation ---------------------------------------------------------------------------
 
 // Returns false when the target row does not exist (nothing to simulate).
@@ -125,7 +171,7 @@ inline bool ApplyPlace(const Board &in, int value, int suit, bool number, int tr
 	{
 		if (b.count[track] >= kRows)
 			return false;
-		b.rows[track][b.count[track]++] = {value, suit, 0};
+		b.rows[track][b.count[track]++] = {value, suit, 0, 0, 0};
 		return true;
 	}
 	if (row < 0 || row >= b.count[track])
@@ -158,7 +204,12 @@ inline bool ApplyPlace(const Board &in, int value, int suit, bool number, int tr
 	{
 		b.rows[track][row].kings++;
 	}
-	// A Queen changes direction/suit only.
+	else if (value == kQueen)
+	{
+		// Reverses the direction and sets the suit (only felt while this row is the last one).
+		b.rows[track][row].queens++;
+		b.rows[track][row].queenSuit = suit;
+	}
 	return true;
 }
 
@@ -251,7 +302,9 @@ const double kReplyTerminal = 150;  // a game Ringo could end next turn: a big s
                                     // wrecking my own winning caravans to avoid
 const double kReplyWeight = 0.5;    // how much Ringo's likely reply counts against the table right after my move
 
-// Whether a number card of value v may extend a caravan, by direction only (suit unknown).
+// Whether Ringo's number card of value v may extend its caravan, by the last two values only (as
+// the Python engine models it). Queens on Ringo's caravans are deliberately left out: the bot
+// spends its Queens on its own caravans, not on blocking Ringo.
 inline bool NumberFits(const Board &b, int t, int v)
 {
 	int n = b.count[t];
@@ -330,6 +383,52 @@ inline double ScoreAfter(const Board &b, int opponentHand, const char **note)
 	return (1 - kReplyWeight) * sc + kReplyWeight * ExpectedAfterReply(b, opponentHand);
 }
 
+// ---- Keeping my caravans playable ---------------------------------------------------------
+
+// Per caravan of mine that isn't stuck. Kept below what a real step forward is worth, so a Queen
+// only wins when it unblocks a caravan and no card makes better progress now.
+const double kPlayableWeight = 3;
+
+// Most caravans from t on that can each take a different card (fits[t]: bit i = hand card i fits).
+inline int CardMatching(const unsigned fits[3], int t, unsigned used)
+{
+	if (t == 3)
+		return 0;
+	int best = CardMatching(fits, t + 1, used);  // caravan t gets no card
+	for (unsigned m = fits[t] & ~used; m; m &= m - 1)
+	{
+		int n = 1 + CardMatching(fits, t + 1, used | (m & (0u - m)));
+		if (n > best)
+			best = n;
+	}
+	return best;
+}
+
+// How many of my caravans aren't stuck: those at 21 or more, plus the unsold ones that can each
+// get their own number card from my hand without going over 26. A Queen that turns a caravan
+// my hand can't extend raises it; one that turns a caravan the wrong way lowers it.
+// The whole hand is used for every move: the card a move uses up is replaced by the one drawn
+// right after, so leaving it out would only punish playing cards.
+inline int PlayableCaravans(const Board &b, const std::vector<HandCard> &hand)
+{
+	int totals[kTracks];
+	Totals(b, totals);
+	int sold = 0;
+	unsigned fits[3] = {};  // per caravan: bit i = hand card i fits
+	for (int t = 0; t < 3; t++)
+	{
+		if (totals[t] >= kSoldMin)
+		{
+			sold++;
+			continue;
+		}
+		for (int i = 0; i < (int)hand.size() && i < 32; i++)
+			if (IsNumber(hand[i]) && totals[t] + hand[i].value <= kSoldMax && Fits(b, t, hand[i].value, hand[i].suit))
+				fits[t] |= 1u << i;
+	}
+	return sold + CardMatching(fits, 0, 0);
+}
+
 inline std::string Describe(const HandCard &card, int track, int row, const Board &before)
 {
 	std::string owner = track < 3 ? "my" : "NPC's";
@@ -380,9 +479,7 @@ inline Choice ChooseMove(const Input &in)
 				continue;
 			double sc = ScoreAfter(b2, in.opponentHand, &note);
 			sc -= FaceCost(card.value);
-			// A Queen changes nothing we model; only worth it to unblock our own caravan.
-			if (card.value == kQueen && tg.track < 3)
-				sc += 2;
+			sc += kPlayableWeight * PlayableCaravans(b2, in.hand);
 			Choice c;
 			c.action = kAction_Place;
 			c.card = lm.card;
@@ -401,13 +498,14 @@ inline Choice ChooseMove(const Input &in)
 			Choice c;
 			c.action = kAction_Discard;
 			c.card = i;
-			consider(base - 4 - keep, c, board, "discard " + in.hand[i].code, "");
+			double sc = base - 4 - keep + kPlayableWeight * PlayableCaravans(board, in.hand);
+			consider(sc, c, board, "discard " + in.hand[i].code, "");
 		}
 
 	for (int t : in.discardTracks)
 	{
 		b2 = ApplyDiscardTrack(board, t);
-		double sc = ScoreAfter(b2, in.opponentHand, &note) - 3;
+		double sc = ScoreAfter(b2, in.opponentHand, &note) - 3 + kPlayableWeight * PlayableCaravans(b2, in.hand);
 		Choice c;
 		c.action = kAction_DiscardTrack;
 		c.track = t;

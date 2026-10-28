@@ -24,5 +24,6 @@ Mod page: https://www.nexusmods.com/newvegas/mods/100280
 
 ## Changelog
 
+- 1.0.2: the bot now tracks each caravan's direction and suit, and uses Queens to unblock its own caravans when its hand can't extend them, instead of playing them as filler.
 - 1.0.1: retries the card click up to 6 times instead of 3 (the game can ignore it for about 6 s while a drawn card slides into the hand).
 - 1.0.0: first release.

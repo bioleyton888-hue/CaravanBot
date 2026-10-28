@@ -901,10 +901,19 @@ static void BotPlayTurn(const Snapshot &s, DWORD now)
 		{
 			if (s.cellCount[r][t] == 0)
 				continue;
-			int kings = 0;
+			caravan_ai::Row row = {s.cells[r][t][0].value, s.cells[r][t][0].suit, 0, 0, 0};
 			for (int i = 1; i < s.cellCount[r][t]; i++)
-				kings += s.cells[r][t][i].value == caravan_ai::kKing;
-			in.board.rows[t][in.board.count[t]++] = {s.cells[r][t][0].value, s.cells[r][t][0].suit, kings};
+			{
+				const Card &c = s.cells[r][t][i];
+				if (c.value == caravan_ai::kKing)
+					row.kings++;
+				else if (c.value == caravan_ai::kQueen)
+				{
+					row.queens++;
+					row.queenSuit = c.suit;
+				}
+			}
+			in.board.rows[t][in.board.count[t]++] = row;
 		}
 	for (int i = 0; i < s.numPlayerHand; i++)
 		in.hand.push_back({s.playerHand[i].value, s.playerHand[i].suit, CardCode(s.playerHand[i])});
@@ -1262,7 +1271,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface *nvse
 {
 	info->infoVersion = PluginInfo::kInfoVersion;
 	info->name = "CaravanBot";
-	info->version = 7;
+	info->version = 8;
 	return !nvse->isEditor;
 }
 
@@ -1302,6 +1311,6 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface *nvse)
 		Log("Could not register for NVSE messages.");
 		return false;
 	}
-	Log("CaravanBot 1.0.1 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
+	Log("CaravanBot 1.0.2 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
 	return true;
 }

@@ -60,7 +60,9 @@ The engine looks one move ahead over every legal move and discard. It also weigh
 
 It aims for caravans worth 21 to 26 and avoids going over. It uses Jacks to remove threats and Kings to push an opponent's caravan past 26.
 
-`tools/caravan_ai.py` is the same engine in Python, kept as the reference: `tests\run_parity.cmd` replays every saved turn in `captures\` through both and checks that they pick the same move.
+It also tracks each caravan's direction and suit, the way the game does, so it knows which of your cards still fit where. It prefers moves that leave each of your unsold caravans a card from your hand to grow with. That's what Queens are for: when a caravan is stuck going the wrong way for your hand, the bot turns it with a Queen instead of wasting the Queen as filler.
+
+`tools/caravan_ai.py` is the original engine in Python, without directions or Queens. `tests\run_parity.cmd` replays every saved turn in `captures\` through both and lists the turns where they pick different moves, which is a handy way to review what a strategy change does.
 
 ## External control
 
@@ -99,13 +101,14 @@ Caravan menu  <──(plugin plays it)──  CaravanBot\move.json
 You need Visual Studio 2022 Build Tools (C++).
 
 - `build.cmd` builds `build\CaravanBot.dll` (32-bit).
-- `tests\run_parity.cmd` checks the C++ engine against the Python one (needs Python 3.10+).
-- `python -I tools\test_caravan_ai.py` runs the strategy tests.
+- `tests\run_tests.cmd` runs the C++ engine's strategy tests on hand-built tables.
+- `tests\run_parity.cmd` lists the saved turns where the C++ and Python engines differ (needs Python 3.10+). Add a line number to `build\ai_parity.exe build\parity.txt <line>` to see every candidate move's score for that turn.
+- `python -I tools\test_caravan_ai.py` runs the Python engine's tests.
 - `python -I tools\package.py <version>` builds the Nexus archive, `build\CaravanBot-<version>.zip`.
 
 ## Known limitations
 
-- Queens are treated as filler. The engine doesn't plan around changing a caravan's direction.
+- Queens are only used on your own caravans. The bot doesn't use them to block the opponent's caravans.
 - If the cursor can't reach its target while a card is picked up, the plugin can't cancel. Finish that move by hand.
 - **Alt-tabbing:** on some setups, switching out of the game crashes it. The bot doesn't need you to leave the game.
 

@@ -1,10 +1,10 @@
-"""Exports saved turns and caravan_ai's choice for each, for tests/ai_parity.cpp.
+"""Exports saved turns and the Python engine's choice for each, for tests/ai_parity.cpp.
 
 Usage: python -I export_parity.py <captures dir> <output file>
 Each line is whitespace-separated integers:
   opponentHand canDiscardCard
   nHand {value suit}...
-  for each of the 6 tracks: nRows {value suit kings}...
+  for each of the 6 tracks: nRows {value suit kings queens lastQueenSuit}...
   nLegal {card nTargets {track row}...}...
   nDiscardTracks {track}...
   expected: action(1 place, 2 discard, 3 discard_track) card track row
@@ -40,7 +40,9 @@ for path in sorted(glob.glob(os.path.join(captures, "bot_*.json"))):
         nums.append(len(rows))
         for r in rows:
             cards = r["cards"]
-            nums += [cards[0]["value"], cards[0]["suit"], sum(1 for c in cards[1:] if c["value"] == caravan_ai.KING)]
+            queens = [c for c in cards[1:] if c["value"] == caravan_ai.QUEEN]
+            nums += [cards[0]["value"], cards[0]["suit"], sum(1 for c in cards[1:] if c["value"] == caravan_ai.KING),
+                     len(queens), queens[-1]["suit"] if queens else 0]
     legal = turn.get("legalMoves", [])
     nums.append(len(legal))
     for lm in legal:
