@@ -28,7 +28,7 @@ Fallout New Vegas\Data\NVSE\Plugins\CaravanBot.ini
 - **Start a Caravan game.** The first time each session, a corner message tells you which key turns the bot on.
 - **Press F8 to turn the bot on.** You'll see "Caravan bot: ON" and hear a menu sound. It plays every one of your turns.
 - **Press F8 again to turn it off** and play yourself. You can switch at any point of a match.
-- **Deck screen:** with the bot on, the plugin accepts your deck and presses Play for you. If your deck has fewer than 30 cards, it fills it from your collection first. With the bot off, you build your deck yourself.
+- **Deck screen:** with the bot on, the plugin accepts your deck and presses Play for you. If your deck has fewer than 30 cards, it fills it from your collection to 45 cards (or all you own), so long matches don't run it dry: running out of cards loses the match. A deck of 30 or more that you built is played as it is. With the bot off, you build your deck yourself.
 
 The plugin writes what it's doing, including every move and why it chose it, to `Fallout New Vegas\CaravanBot\CaravanBot.log`. The log starts fresh each time you launch the game.
 
@@ -116,6 +116,7 @@ You need Visual Studio 2022 Build Tools (C++).
 
 ## Changelog
 
+- **1.0.3:** the deck auto-fill builds a 45-card deck instead of stopping just past 30. Against opponents full of Jacks, Jokers and Kings, a 34-card deck ran out before the match ended. The log also shows how many cards are left in both decks on every move.
 - **1.0.2:** the bot tracks each caravan's direction and suit, and uses Queens to unblock its own caravans when its hand can't extend them, instead of playing them as filler.
 - **1.0.1:** retries a card click up to 6 times instead of 3. The game can ignore it for a few seconds while a drawn card slides into the hand.
 - **1.0.0:** first release. The strategy engine runs inside the plugin; no Python needed.

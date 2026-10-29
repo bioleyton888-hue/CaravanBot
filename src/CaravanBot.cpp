@@ -152,6 +152,9 @@ enum
 	kArrow_Down = 0x80000004,
 
 	kMinDeckSize = 30,
+	// What the bot fills an under-sized deck up to: long matches against decks full of Jacks,
+	// Jokers and Kings ran a 34-card deck dry, and running out of cards loses the match.
+	kAutoDeckSize = 45,
 
 	kKeyState_Held = 0,
 	kDIK_F8 = 0x42,
@@ -588,6 +591,7 @@ static struct DeckFill
 	int noProgress = 0;
 	DWORD nextActionTick = 0;
 	bool gaveUp = false;
+	UInt32 target = 0;              // deck size the bot is filling to; 0 = not filling
 } g_deck;
 
 static void Log(const std::string &msg)
@@ -938,7 +942,8 @@ static void BotPlayTurn(const Snapshot &s, DWORD now)
 	std::string hand;
 	for (auto &h : in.hand)
 		hand += (hand.empty() ? "" : " ") + h.code;
-	Log("Turn " + std::to_string(g_turn.id) + " (#" + std::to_string(g_turn.number) + ") hand [" + hand + "]: " + c.reason);
+	Log("Turn " + std::to_string(g_turn.id) + " (#" + std::to_string(g_turn.number) + ") hand [" + hand + "] deck " +
+		std::to_string(s.playerDeckCount) + " (npc " + std::to_string(s.opponentDeckCount) + "): " + c.reason);
 	if (c.action == caravan_ai::kAction_None)
 		return;
 
@@ -1095,11 +1100,11 @@ static void StepMove(const Snapshot &s, DWORD now)
 	}
 }
 
-// ---- Deck building: fill the deck to 30 cards, then press Play ---------------------------
+// ---- Deck building: fill an under-sized deck, then press Play ----------------------------
 
 // Clicking Add puts the card shown in the collection into the deck. When a click adds nothing
 // (card already used, or the deck view is showing), step to the next card, and now and then
-// switch back to the All Cards view, until the deck reaches 30 or we run out of attempts.
+// switch back to the All Cards view, until the deck reaches its target or we run out of attempts.
 static void FillDeck(const Snapshot &s, DWORD now)
 {
 	if (now < g_deck.nextActionTick)
@@ -1113,7 +1118,8 @@ static void FillDeck(const Snapshot &s, DWORD now)
 	if (g_deck.noProgress > 40)
 	{
 		g_deck.gaveUp = true;
-		g_turn.lastResult = "could not fill the deck automatically; add cards and press Play yourself";
+		if (s.cardsInDeck < kMinDeckSize)
+			g_turn.lastResult = "could not fill the deck automatically; add cards and press Play yourself";
 		Log("Deck building: gave up adding cards at " + std::to_string(s.cardsInDeck));
 		return;
 	}
@@ -1141,18 +1147,26 @@ static void HandleDeckScreen(const Snapshot &s, DWORD now)
 		Log("Deck building: " + std::to_string(s.cardsInDeck) + " of " + std::to_string(s.totalCards) + " cards in the deck");
 	}
 	// With the bot off you build your own deck and press Play yourself.
-	if (!g_bot.enabled || g_deckPlayClicked || g_deck.gaveUp || s.stage != 0 || now - g_deckEnteredTick < 1500)
+	if (!g_bot.enabled || g_deckPlayClicked || s.stage != 0 || now - g_deckEnteredTick < 1500)
 		return;
-	if (s.cardsInDeck < kMinDeckSize)
+	// A deck you built (30 cards or more) is played as it is; an under-sized one is filled to
+	// kAutoDeckSize, or to every card you own if you have fewer.
+	if (!g_deck.target && s.cardsInDeck < kMinDeckSize)
 	{
 		if (s.totalCards < kMinDeckSize)
 		{
 			g_turn.lastResult = "you own fewer than 30 caravan cards";
 			return;
 		}
+		g_deck.target = s.totalCards < kAutoDeckSize ? s.totalCards : kAutoDeckSize;
+	}
+	if (g_deck.target && !g_deck.gaveUp && s.cardsInDeck < g_deck.target)
+	{
 		FillDeck(s, now);
 		return;
 	}
+	if (s.cardsInDeck < kMinDeckSize)
+		return;  // gave up below the game's minimum: you finish the deck yourself
 	if (g_deck.lastCount != (UInt32)-1)
 		Log("Deck building: filled the deck to " + std::to_string(s.cardsInDeck) + " cards");
 	g_deckPlayClicked = true;
@@ -1271,7 +1285,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface *nvse
 {
 	info->infoVersion = PluginInfo::kInfoVersion;
 	info->name = "CaravanBot";
-	info->version = 8;
+	info->version = 9;
 	return !nvse->isEditor;
 }
 
@@ -1311,6 +1325,6 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface *nvse)
 		Log("Could not register for NVSE messages.");
 		return false;
 	}
-	Log("CaravanBot 1.0.2 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
+	Log("CaravanBot 1.0.3 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
 	return true;
 }
