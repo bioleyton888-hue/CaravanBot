@@ -116,6 +116,14 @@ enum : UInt32
 	// placement rule check (Better Caravan loops it over the board to grey out unusable cards).
 	kAddr_CaravanMenu_CanPlaceCard = 0x74F6C0,
 
+	// The tail of the engine's own cursor move, MoveSelection 0x74F360 (FNV decompilation, caravanmenu.cpp): after
+	// writing selectedTrack/selectedRow/cell count it calls SelectCard (hover sound + highlight node only), sets
+	// PreventSelectCard from CanPlaceCard and refreshes the buttons. The direct cursor jump makes the same calls.
+	kAddr_CaravanMenu_SelectCard = 0x74E6D0,      // void __thiscall (menu, int track, int row)
+	kAddr_CaravanMenu_SetFlag = 0x73BAB0,         // void __thiscall (menu, int flag, int on)
+	kAddr_CaravanMenu_UpdateControls = 0x749A40,  // void __thiscall (menu, int -1)
+	kOff_SelectedCellCount = 0xE38,               // cards in the slot under the cursor
+
 	// Keyboard, messages and sounds (as Better Caravan, JIP and ShowOff call them).
 	kAddr_OSInputGlobalsSingleton = 0x11F35CC,
 	kAddr_OSInputGlobals_GetKeyState = 0xA24180,  // bool (int DirectInput key, KeyState)
@@ -368,6 +376,38 @@ static bool ScanLegalPlacements(const Snapshot &s, bool legal[kMaxHand][kNumTrac
 	return true;
 }
 
+typedef void(__fastcall *SelectCard_t)(UInt32 menu, void *edx, int track, int row);
+typedef void(__fastcall *SetFlag_t)(UInt32 menu, void *edx, int flag, int on);
+typedef void(__fastcall *UpdateControls_t)(UInt32 menu, void *edx, int value);
+
+// Puts the placing cursor straight on (track, row), exactly as MoveSelection 0x74F360 finishes an arrow press.
+// Only call in placing mode. The caller checks on the next step that the cursor really is there (and falls back to
+// arrow presses if not); flag 0x4 afterwards is the engine's own verdict on the slot.
+static bool JumpCursor(int track, int row)
+{
+	__try
+	{
+		UInt32 menu = GetMenu();
+		if (!menu || !(Read<UInt32>(menu, kOff_Flags) & kFlag_IsPlaceCard))
+			return false;
+		int handIdx = Read<int>(menu, kOff_SelectedCardIdx);
+		SimpleArray *cell = (SimpleArray *)(menu + kOff_BoardCards + (track * kNumRows + row) * sizeof(SimpleArray));
+		*(UInt32 *)(menu + kOff_LastPressedArrowKey) = 0;  // no stale arrow may move it again
+		*(int *)(menu + kOff_SelectedTrack) = track;
+		*(int *)(menu + kOff_SelectedRow) = row;
+		*(UInt32 *)(menu + kOff_SelectedCellCount) = cell->size;
+		((SelectCard_t)kAddr_CaravanMenu_SelectCard)(menu, nullptr, track, row);
+		bool legal = ((CanPlaceCard_t)kAddr_CaravanMenu_CanPlaceCard)(menu, nullptr, track, row, handIdx, false);
+		((SetFlag_t)kAddr_CaravanMenu_SetFlag)(menu, nullptr, kFlag_PreventSelectCard, legal ? 0 : 1);
+		((UpdateControls_t)kAddr_CaravanMenu_UpdateControls)(menu, nullptr, -1);
+		return true;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		return false;
+	}
+}
+
 static bool PressArrow(UInt32 arrow)
 {
 	__try
@@ -590,6 +630,8 @@ static struct
 	DWORD blockedSince = 0;       // when a click first had to wait for the engine to accept input (0 = not waiting)
 	std::string blockedReason;    // the last reason logged, so a long wait logs once
 	DWORD strayModeSince = 0;     // bot idle but the game sits in placing / discard-caravan mode
+	bool jumpTried = false;       // the direct cursor jump was attempted for this move
+	const char *navPath = "";     // how the cursor reached the target: logged with the result
 } g_exec;
 
 static struct
@@ -936,6 +978,8 @@ static bool StartMove(Move m, DWORD now)
 	g_exec.lastIdx = g_exec.lastTrack = g_exec.lastRow = -99;
 	g_exec.blockedSince = 0;
 	g_exec.blockedReason.clear();
+	g_exec.jumpTried = false;
+	g_exec.navPath = "";
 	g_exec.nextActionTick = now;
 	g_turn.awaiting = false;
 	Log("Turn " + std::to_string(m.turn) + ": got move " + m.action + " card=" + std::to_string(m.card) +
@@ -1169,10 +1213,34 @@ static void StepMove(const Snapshot &s, DWORD now)
 			}
 			if (GatedClick(s, kButton_CGM_SelectCard, kOff_Tile_CGM_SelectCardButton, true, now) != kClick_Done)
 				return;
-			char buf[96];
-			sprintf_s(buf, "ok: %s track %d row %d", m.action == "discard_track" ? "discarded caravan" : "placed on", s.selectedTrack, s.selectedRow);
+			if (!*g_exec.navPath)
+				g_exec.navPath = g_exec.presses ? "arrows" : "already there";
+			char buf[128];
+			sprintf_s(buf, "ok: %s track %d row %d (cursor: %s)", m.action == "discard_track" ? "discarded caravan" : "placed on",
+				s.selectedTrack, s.selectedRow, g_exec.navPath);
 			FinishMove(s, buf);
 			return;
+		}
+		// A normal placement (not the opening, which the engine steers itself, and not discard-caravan): put the
+		// cursor straight on the target, then check on the next step that it is there.
+		if (!g_exec.jumpTried && m.action == "place" && m.row >= 0 && !IsOpening(s))
+		{
+			g_exec.jumpTried = true;
+			if (JumpCursor(m.track, m.row))
+			{
+				g_exec.navPath = "jump";
+				g_exec.nextActionTick = now + 150;
+				return;
+			}
+			Log("Turn " + std::to_string(m.turn) + ": cursor jump failed to run; using the arrows");
+		}
+		if (!strcmp(g_exec.navPath, "jump"))
+		{
+			char buf[160];
+			sprintf_s(buf, "Turn %d: the cursor jump did not land (at track %d row %d, target %d/%d); using the arrows",
+				m.turn, s.selectedTrack, s.selectedRow, m.track, m.row);
+			Log(buf);
+			g_exec.navPath = "arrows after a failed jump";
 		}
 		bool moved = s.selectedTrack != g_exec.lastTrack || s.selectedRow != g_exec.lastRow;
 		g_exec.stuck = moved ? 0 : g_exec.stuck + 1;
@@ -1419,7 +1487,7 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface *nvse
 {
 	info->infoVersion = PluginInfo::kInfoVersion;
 	info->name = "CaravanBot";
-	info->version = 10;
+	info->version = 11;
 	// Every address in this file is for FalloutNV.exe 1.4.0.525; on any other build they point at the wrong code.
 	return !nvse->isEditor && nvse->runtimeVersion == kRuntime_1_4_0_525;
 }
@@ -1460,6 +1528,6 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface *nvse)
 		Log("Could not register for NVSE messages.");
 		return false;
 	}
-	Log("CaravanBot 1.0.4 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
+	Log("CaravanBot 1.0.5 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
 	return true;
 }
