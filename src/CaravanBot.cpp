@@ -65,6 +65,8 @@ struct NVSEMessagingInterface
 	bool (*Dispatch)(PluginHandle sender, UInt32 messageType, void *data, UInt32 dataLen, const char *receiver);
 };
 
+static const UInt32 kRuntime_1_4_0_525 = 0x040020D0;  // xNVSE RUNTIME_VERSION_1_4_0_525
+
 enum
 {
 	kInterface_Messaging = 2,
@@ -101,6 +103,7 @@ enum : UInt32
 	kOff_SelectedTrack = 0xE30,
 	kOff_SelectedRow = 0xE34,
 	kOff_Flags = 0xE74,
+	kOff_TutorialShown = 0xE78,   // byte: a tutorial popup is up; the engine ignores every game key (0x747D30)
 	kOff_LastPressedArrowKey = 0xE80,
 
 	kOff_FormRefID = 0x0C,
@@ -131,6 +134,10 @@ enum
 
 	kFlag_PreventInputs = 0x1,      // set for the whole NPC turn and during every animation
 	kFlag_NotEnoughCardsInDeck = 0x2,
+	// Select is ignored while set: in placing mode the slot under the cursor is illegal (MoveSelection 0x74F360
+	// sets it from CanPlaceCard); in the opening a face card is selected in the hand.
+	kFlag_PreventSelectCard = 0x4,
+	kFlag_NpcTurnRunning = 0x4000,  // the update loop is playing the NPC's move; game keys are ignored
 	kFlag_RestrictToFirstColumn = 0x100,
 	kFlag_PlayerWon = 0x400,           // on the results screen
 	kFlag_RestrictToFirstRow = 0x800,  // with RestrictToFirstColumn: the opening (one number card per caravan)
@@ -144,6 +151,10 @@ enum
 	kButton_CGM_SelectCard = 19,
 	kButton_CGM_DiscardCard = 20,
 	kButton_CGM_DiscardTrack = 21,
+	// HandleClick 0x749560 turns 22 into the cancel action (0x7490E0, the code Better Caravan hooks at 0x749241):
+	// in placing / discard-caravan mode it puts the card back. Outside those modes the same action opens the
+	// "quit the game?" box, so only send it while IsPlaceCard or IsDiscardTrack is set.
+	kButton_CGM_Cancel = 22,
 
 	// Values the engine reads from lastPressedArrowKey (as Better Caravan's WASD support writes them).
 	kArrow_Left = 0x80000001,
@@ -206,6 +217,7 @@ struct Snapshot
 	Card cells[kNumRows][kNumTracks][kMaxCell];
 	CaravanValue caravanValues[kNumTracks];
 	int selectedCardIdx, selectedTrack, selectedRow;
+	bool tutorialShown;
 };
 
 // ---- Reading and poking the menu (no C++ objects in here: __try needs a plain frame) -----
@@ -282,6 +294,7 @@ static bool TakeSnapshot(Snapshot &s)
 		s.selectedCardIdx = Read<int>(menu, kOff_SelectedCardIdx);
 		s.selectedTrack = Read<int>(menu, kOff_SelectedTrack);
 		s.selectedRow = Read<int>(menu, kOff_SelectedRow);
+		s.tutorialShown = Read<unsigned char>(menu, kOff_TutorialShown) != 0;
 		s.ok = true;
 		return true;
 	}
@@ -293,6 +306,7 @@ static bool TakeSnapshot(Snapshot &s)
 
 typedef void(__fastcall *HandleClick_t)(UInt32 menu, void *edx, int tileID, UInt32 tile);
 
+// tileOffset 0 = no tile (the handler only looks at the id).
 static bool ClickButton(int buttonID, UInt32 tileOffset)
 {
 	__try
@@ -301,7 +315,8 @@ static bool ClickButton(int buttonID, UInt32 tileOffset)
 		if (!menu)
 			return false;
 		UInt32 *vtbl = *(UInt32 **)menu;
-		((HandleClick_t)vtbl[kVtbl_HandleClick])(menu, nullptr, buttonID, Read<UInt32>(menu, tileOffset));
+		UInt32 tile = tileOffset ? Read<UInt32>(menu, tileOffset) : 0;
+		((HandleClick_t)vtbl[kVtbl_HandleClick])(menu, nullptr, buttonID, tile);
 		return true;
 	}
 	__except (EXCEPTION_EXECUTE_HANDLER)
@@ -540,6 +555,7 @@ struct Move
 enum Phase
 {
 	kPhase_Idle,
+	kPhase_ClickDiscardTrack,
 	kPhase_SelectHandCard,
 	kPhase_WaitForMode,
 	kPhase_Navigate,
@@ -571,6 +587,9 @@ static struct
 	int stuck = 0;
 	int retries = 0;              // extra clicks when the game ignored the first one
 	int lastIdx = -99, lastTrack = -99, lastRow = -99;
+	DWORD blockedSince = 0;       // when a click first had to wait for the engine to accept input (0 = not waiting)
+	std::string blockedReason;    // the last reason logged, so a long wait logs once
+	DWORD strayModeSince = 0;     // bot idle but the game sits in placing / discard-caravan mode
 } g_exec;
 
 static struct
@@ -802,6 +821,79 @@ static void FinishMove(const Snapshot &s, const std::string &result)
 	Log("Turn " + std::to_string(g_exec.move.turn) + ": " + result);
 }
 
+static std::string Hex(UInt32 v)
+{
+	char buf[16];
+	sprintf_s(buf, "0x%X", v);
+	return buf;
+}
+
+// Why the engine would ignore a game-screen click right now ("" = it takes it). The same tests, in the same
+// order, as HandleClick 0x749560 (stage, PreventInputs) and the key handler 0x747D30 it forwards to (tutorial,
+// AllowInputs, NPC turn running; PreventSelectCard only for the Select button).
+static std::string ClickBlocker(const Snapshot &s, bool selectButton)
+{
+	if (s.stage != 0)
+		return "game stage " + std::to_string(s.stage) + " (animation running)";
+	if (s.flags & kFlag_PreventInputs)
+		return "inputs blocked (flag 0x1)";
+	if (s.tutorialShown)
+		return "a tutorial popup is open";
+	if (!(s.flags & kFlag_AllowInputs))
+		return "inputs not allowed yet (flag 0x10000 off)";
+	if (s.flags & kFlag_NpcTurnRunning)
+		return "the NPC's move is still running (flag 0x4000)";
+	if (selectButton && (s.flags & kFlag_PreventSelectCard))
+		return (s.flags & kFlag_IsPlaceCard) ? "the slot under the cursor is illegal (flag 0x4)"
+											   : "the selected card cannot be played now (flag 0x4)";
+	return "";
+}
+
+// Puts a picked-up card back (or leaves discard-caravan mode) through the engine's own cancel.
+static bool CancelMode(const Snapshot &s, const char *why)
+{
+	if (!s.ok || s.menu != kMenu_Game || !(s.flags & (kFlag_IsPlaceCard | kFlag_IsDiscardTrack)) ||
+		(s.flags & kFlag_PreventInputs))
+		return false;
+	bool ok = ClickButton(kButton_CGM_Cancel, 0);
+	Log(std::string(ok ? "Cancelled " : "Could not cancel ") +
+		((s.flags & kFlag_IsDiscardTrack) ? "discard-caravan" : "placing") + " mode: " + why);
+	return ok;
+}
+
+enum ClickResult { kClick_Done, kClick_Wait, kClick_GaveUp };
+
+// Clicks only when the engine will take it; otherwise waits (logging the reason once) and gives up after
+// 10 s, cancelling a half-done move so the game is not left with a card in hand.
+static ClickResult GatedClick(const Snapshot &s, int buttonID, UInt32 tileOffset, bool selectButton, DWORD now)
+{
+	std::string blocker = ClickBlocker(s, selectButton);
+	if (blocker.empty())
+	{
+		g_exec.blockedSince = 0;
+		g_exec.blockedReason.clear();
+		ClickButton(buttonID, tileOffset);
+		return kClick_Done;
+	}
+	if (!g_exec.blockedSince)
+		g_exec.blockedSince = now;
+	if (blocker != g_exec.blockedReason)
+	{
+		g_exec.blockedReason = blocker;
+		Log("Turn " + std::to_string(g_exec.move.turn) + ": waiting to click " + std::to_string(buttonID) + ": " + blocker);
+	}
+	if (now - g_exec.blockedSince > 10000)
+	{
+		CancelMode(s, "the click never became possible");
+		FinishMove(s, "error: the game would not take the click (" + blocker + ")");
+		g_exec.blockedSince = 0;
+		g_exec.blockedReason.clear();
+		return kClick_GaveUp;
+	}
+	g_exec.nextActionTick = now + 100;
+	return kClick_Wait;
+}
+
 // Checks the move against the engine's rules and starts carrying it out. A rejected move keeps
 // the turn open (same id), so a corrected move can be sent straight away.
 static bool StartMove(Move m, DWORD now)
@@ -842,22 +934,14 @@ static bool StartMove(Move m, DWORD now)
 	g_exec.move = m;
 	g_exec.presses = g_exec.stuck = g_exec.retries = 0;
 	g_exec.lastIdx = g_exec.lastTrack = g_exec.lastRow = -99;
+	g_exec.blockedSince = 0;
+	g_exec.blockedReason.clear();
 	g_exec.nextActionTick = now;
 	g_turn.awaiting = false;
 	Log("Turn " + std::to_string(m.turn) + ": got move " + m.action + " card=" + std::to_string(m.card) +
 		" track=" + std::to_string(m.track) + " row=" + std::to_string(m.row));
 
-	if (m.action == "discard_track")
-	{
-		ClickButton(kButton_CGM_DiscardTrack, kOff_Tile_CGM_DiscardTrackButton);
-		g_exec.phase = kPhase_WaitForMode;
-		g_exec.deadline = now + 2000;
-		g_exec.nextActionTick = now + 200;
-	}
-	else
-	{
-		g_exec.phase = kPhase_SelectHandCard;
-	}
+	g_exec.phase = m.action == "discard_track" ? kPhase_ClickDiscardTrack : kPhase_SelectHandCard;
 	return true;
 }
 
@@ -969,6 +1053,15 @@ static void StepMove(const Snapshot &s, DWORD now)
 
 	switch (g_exec.phase)
 	{
+	case kPhase_ClickDiscardTrack:
+		if (GatedClick(s, kButton_CGM_DiscardTrack, kOff_Tile_CGM_DiscardTrackButton, false, now) == kClick_Done)
+		{
+			g_exec.phase = kPhase_WaitForMode;
+			g_exec.deadline = now + 2000;
+			g_exec.nextActionTick = now + 200;
+		}
+		return;
+
 	case kPhase_SelectHandCard:
 	{
 		if (m.card < 0 || m.card >= s.numPlayerHand)
@@ -989,11 +1082,12 @@ static void StepMove(const Snapshot &s, DWORD now)
 		{
 			if (m.action == "discard")
 			{
-				ClickButton(kButton_CGM_DiscardCard, kOff_Tile_CGM_DiscardCardButton);
-				FinishMove(s, "ok: discarded " + CardCode(s.playerHand[m.card]));
+				if (GatedClick(s, kButton_CGM_DiscardCard, kOff_Tile_CGM_DiscardCardButton, false, now) == kClick_Done)
+					FinishMove(s, "ok: discarded " + CardCode(s.playerHand[m.card]));
 				return;
 			}
-			ClickButton(kButton_CGM_SelectCard, kOff_Tile_CGM_SelectCardButton);
+			if (GatedClick(s, kButton_CGM_SelectCard, kOff_Tile_CGM_SelectCardButton, true, now) != kClick_Done)
+				return;
 			g_exec.phase = kPhase_WaitForMode;
 			g_exec.deadline = now + 2000;
 			g_exec.presses = g_exec.stuck = 0;
@@ -1028,11 +1122,16 @@ static void StepMove(const Snapshot &s, DWORD now)
 			// still sliding into the hand. Click again instead of giving the turn back. In game the
 			// click landed about 7 s in (on the 4th try), so 6 retries leave room to spare.
 			g_exec.retries++;
-			Log("Turn " + std::to_string(m.turn) + ": no reaction to the click, retry " + std::to_string(g_exec.retries));
+			// The click passed every gate we know of and still did nothing: log the full state so the cause
+			// can be read from CaravanBot.log.
+			std::string blocker = ClickBlocker(s, m.action != "discard_track");
+			Log("Turn " + std::to_string(m.turn) + ": no reaction to the click, retry " + std::to_string(g_exec.retries) +
+				" (stage " + std::to_string(s.stage) + ", flags " + Hex(s.flags) + ", hand idx " +
+				std::to_string(s.selectedCardIdx) + "/" + std::to_string(s.numPlayerHand) +
+				(blocker.empty() ? ", no known blocker)" : ", now: " + blocker + ")"));
 			if (m.action == "discard_track")
 			{
-				ClickButton(kButton_CGM_DiscardTrack, kOff_Tile_CGM_DiscardTrackButton);
-				g_exec.deadline = now + 2000;
+				g_exec.phase = kPhase_ClickDiscardTrack;
 				g_exec.nextActionTick = now + 200;
 			}
 			else
@@ -1058,7 +1157,18 @@ static void StepMove(const Snapshot &s, DWORD now)
 		bool rowOk = m.row < 0 ? sideOk : curY == ScreenY(m.track, m.row);
 		if (curCol == tCol && sideOk && rowOk)
 		{
-			ClickButton(kButton_CGM_SelectCard, kOff_Tile_CGM_SelectCardButton);
+			// Flag 0x4 here means the engine judges this slot illegal: Select would be ignored forever.
+			if (m.action == "place" && (s.flags & kFlag_PreventSelectCard) && ClickBlocker(s, false).empty())
+			{
+				CancelMode(s, "the target slot is illegal");
+				char buf[128];
+				sprintf_s(buf, "error: the game says track %d row %d is illegal for that card; card put back",
+					s.selectedTrack, s.selectedRow);
+				FinishMove(s, buf);
+				return;
+			}
+			if (GatedClick(s, kButton_CGM_SelectCard, kOff_Tile_CGM_SelectCardButton, true, now) != kClick_Done)
+				return;
 			char buf[96];
 			sprintf_s(buf, "ok: %s track %d row %d", m.action == "discard_track" ? "discarded caravan" : "placed on", s.selectedTrack, s.selectedRow);
 			FinishMove(s, buf);
@@ -1068,9 +1178,11 @@ static void StepMove(const Snapshot &s, DWORD now)
 		g_exec.stuck = moved ? 0 : g_exec.stuck + 1;
 		if (g_exec.presses > 40 || g_exec.stuck >= 4)
 		{
-			char buf[128];
-			sprintf_s(buf, "error: cursor stuck at track %d row %d (target track %d row %d); still in placing mode",
-				s.selectedTrack, s.selectedRow, m.track, m.row);
+			bool cancelled = CancelMode(s, "the cursor got stuck");
+			char buf[160];
+			sprintf_s(buf, "error: cursor stuck at track %d row %d (target track %d row %d); %s",
+				s.selectedTrack, s.selectedRow, m.track, m.row,
+				cancelled ? "card put back, the turn is offered again" : "still in placing mode");
 			FinishMove(s, buf);
 			return;
 		}
@@ -1232,6 +1344,27 @@ static void ShowHint(const Snapshot &s)
 	}
 }
 
+// With the bot on and no move running, the game should never sit in placing / discard-caravan mode: that is a
+// move that failed half-way (a placing click that came too late, or one the game ignored). Put the card back
+// after 3 s so the turn is offered again instead of hanging.
+static void WatchStrayMode(const Snapshot &s, DWORD now)
+{
+	bool stray = g_bot.enabled && s.ok && s.menu == kMenu_Game && s.stage == 0 && g_exec.phase == kPhase_Idle &&
+		(s.flags & (kFlag_IsPlaceCard | kFlag_IsDiscardTrack));
+	if (!stray)
+	{
+		g_exec.strayModeSince = 0;
+		return;
+	}
+	if (!g_exec.strayModeSince)
+		g_exec.strayModeSince = now;
+	else if (now - g_exec.strayModeSince > 3000)
+	{
+		CancelMode(s, "the bot was idle with a card still picked up");
+		g_exec.strayModeSince = 0;
+	}
+}
+
 // ---- Main loop --------------------------------------------------------------------------
 
 static void OnMessage(NVSEMessagingInterface::Message *msg)
@@ -1262,6 +1395,7 @@ static void OnMessage(NVSEMessagingInterface::Message *msg)
 		else if (g_external)
 			TryExternalMove(now);
 		StepMove(snap, now);
+		WatchStrayMode(snap, now);
 	}
 
 	if (!g_external)
@@ -1285,8 +1419,9 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Query(const NVSEInterface *nvse
 {
 	info->infoVersion = PluginInfo::kInfoVersion;
 	info->name = "CaravanBot";
-	info->version = 9;
-	return !nvse->isEditor;
+	info->version = 10;
+	// Every address in this file is for FalloutNV.exe 1.4.0.525; on any other build they point at the wrong code.
+	return !nvse->isEditor && nvse->runtimeVersion == kRuntime_1_4_0_525;
 }
 
 extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface *nvse)
@@ -1325,6 +1460,6 @@ extern "C" __declspec(dllexport) bool NVSEPlugin_Load(const NVSEInterface *nvse)
 		Log("Could not register for NVSE messages.");
 		return false;
 	}
-	Log("CaravanBot 1.0.3 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
+	Log("CaravanBot 1.0.4 loaded (toggle key " + KeyName(g_bot.key) + (g_external ? ", external control on" : "") + ").");
 	return true;
 }

@@ -116,6 +116,7 @@ You need Visual Studio 2022 Build Tools (C++).
 
 ## Changelog
 
+- **1.0.4:** more reliable moves. Every click now waits until the game will accept it (no animation running, no tutorial popup, opponent's move finished), using the same checks as the game itself. A move that can't be finished puts the card back through the game's own cancel and the turn is tried again, instead of leaving a card stuck in your hand. The plugin only loads on FNV 1.4.0.525. When the game ignores a click, the log says why.
 - **1.0.3:** the deck auto-fill builds a 45-card deck instead of stopping just past 30. Against opponents full of Jacks, Jokers and Kings, a 34-card deck ran out before the match ended. The log also shows how many cards are left in both decks on every move.
 - **1.0.2:** the bot tracks each caravan's direction and suit, and uses Queens to unblock its own caravans when its hand can't extend them, instead of playing them as filler.
 - **1.0.1:** retries a card click up to 6 times instead of 3. The game can ignore it for a few seconds while a drawn card slides into the hand.
